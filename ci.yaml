@@ -1,0 +1,214 @@
+name: MyApp CI
+
+on: [push]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+env:
+  APP_NAME: myapp
+  AWS_ECR_ACCOUNT: myorg-toolbox
+  GIT_BRANCH: ${{ github.ref }}
+  GIT_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+  GIT_COMMITTER_NAME: ${{ github.event.head_commit.committer.name }}
+  GIT_COMMITTER_EMAIL: ${{ github.event.head_commit.committer.email }}
+
+jobs:
+  code-styling:
+    name: "Run code styling check"
+    runs-on: arc-runner-set
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Checkout shared Github Actions
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+          repository: myorg/gh-actions
+          ref: ${{ vars.GHA_CUSTOM_REF }}
+          path: .github/actions
+
+      - name: Get AWS Credentials
+        id: aws-creds
+        uses: ./.github/actions/aws/sts/creds
+        with:
+          environment: ${{ env.AWS_ECR_ACCOUNT }}
+
+      - name: AWS ECR Login
+        id: ecr-login
+        uses: ./.github/actions/aws/ecr/login
+        env:
+          AWS_ACCESS_KEY_ID: ${{ steps.aws-creds.outputs.access_key_id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.aws-creds.outputs.secret_access_key }}
+          AWS_SESSION_TOKEN: ${{ steps.aws-creds.outputs.session_token }}
+
+      - name: Set pending status for code styling check
+        uses: myrotvorets/set-commit-status-action@master
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+          status: pending
+          context: ci/code-quality
+          description: Code styling check is running
+          targetUrl: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Run code styling check
+        id: tests
+        continue-on-error: true
+        run: |
+          if git log -1 --pretty=%B | grep -q ^"Revert"; then
+            echo "Skipping analysis for revert"
+            exit 0
+          fi
+
+          docker run --rm \
+            -v $PWD:/var/www \
+            "${{ vars.CODE_QUALITY_IMAGE }}" \
+            phpcs \
+            --repository=$(git config --get remote.origin.url) \
+            --github-token=${{ secrets.GH_TOKEN }} \
+            | tee "quality-check-report"
+
+      - name: Set final status for code styling check
+        if: always()
+        uses: myrotvorets/set-commit-status-action@master
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+          status: ${{ steps.tests.outcome }}
+          context: ci/code-quality
+          description: Code styling check ${{ steps.tests.outcome == 'success' && 'passed' || 'failed' }}
+          targetUrl: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Fail job if tests failed
+        if: steps.tests.outcome == 'failure'
+        run: |
+          echo "Code styling check failed — please review the report."
+          exit 1
+
+  unit-tests:
+    name: "Run unit tests"
+    runs-on: arc-runner-set
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        run: |
+          docker-php-ext-enable xdebug
+
+          cat > /usr/local/etc/php/php.ini <<'INI'
+          output_buffering=4096
+          serialize_precision=17
+          expose_php=0
+          max_input_time=60
+          memory_limit=256M
+          error_reporting=E_ALL & ~E_DEPRECATED & ~E_USER_DEPRECATED & ~E_STRICT
+          display_errors=0
+          display_startup_errors=0
+          variables_order=GPCS
+          request_order=GP
+          register_argc_argv=0
+          post_max_size=1G
+          enable_dl=0
+          upload_max_filesize=1G
+          max_input_vars=3000
+          date.timezone="Australia/Sydney"
+          INI
+
+      - name: Set pending status for unit tests
+        uses: myrotvorets/set-commit-status-action@master
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+          status: pending
+          context: CI/UnitTests
+          description: Unit tests are running
+          targetUrl: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.composer/cache
+          key: composer-${{ runner.os }}-${{ hashFiles('**/composer.lock') }}
+          restore-keys: composer-${{ runner.os }}-
+
+      - name: Install Composer dependencies
+        run: |
+          curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/bin --filename=composer --2
+
+          composer config github-oauth.github.com ${{ secrets.GH_TOKEN }}
+          composer install --no-autoloader --no-scripts --prefer-dist
+          composer config --unset github-oauth.github.com
+          composer dump-autoload --optimize
+
+      - name: Configure test environment
+        run: |
+          config_file="application/configs/test.ini"
+          log_config_file="application/configs/log.php"
+          cp application/configs/test.dist.ini ${config_file}
+          cp application/configs/log.dist.php ${log_config_file}
+
+          sed -i.bak "s|%file.path%|/tmp/|g" ${log_config_file}
+          sed -i.bak "s|%log.internal.communication%|false|g" ${log_config_file}
+
+      - name: Run unit tests
+        env:
+          PHP_MEMORY_LIMIT: -1
+          APP_BASE_PATH: ${{ github.workspace }}
+        run: |
+          vendor/bin/phpunit --dump-xdebug-filter .xdebug-filter.php --testsuite Unit
+          vendor/bin/phpunit --prepend .xdebug-filter.php --coverage-clover clover.xml --testsuite Unit
+        id: tests
+        continue-on-error: true
+
+      - name: Set final status for unit tests
+        if: always()
+        uses: myrotvorets/set-commit-status-action@master
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+          status: ${{ steps.tests.outcome }}
+          context: CI/UnitTests
+          description: Unit tests ${{ steps.tests.outcome == 'success' && 'passed' || 'failed' }}
+          targetUrl: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Fail job if tests failed
+        if: steps.tests.outcome == 'failure'
+        run: |
+          echo "Unit tests failed — please review the report."
+          exit 1
+
+      - name: Upload clover report as artifact
+        if: steps.tests.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: clover.xml
+
+
+  build-and-push:
+    needs: unit-tests
+    name: "Build ${{ matrix.target }} image"
+    runs-on: arc-runner-set
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Checkout shared Github Actions
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+          repository: myorg/gh-actions
+          ref: main
+          path: .github/actions
+
+      - name: Build and Push to ECR
+        uses: ./.github/actions/docker/build-push
+        with:
+          app_name: ${{ env.APP_NAME }}
+          tier: ${{ matrix.target }}
+          file: docker/Dockerfile
+          target: ${{ matrix.target }}
+          tag_mutability: MUTABLE
+          args: |
+            GITHUB_TOKEN=${{ secrets.GH_TOKEN }}
+            ${{ matrix.extra_args }}
